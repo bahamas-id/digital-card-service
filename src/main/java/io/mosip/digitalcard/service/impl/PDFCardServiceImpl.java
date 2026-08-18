@@ -5,14 +5,17 @@ import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosip.biometrics.util.ConvertRequestDto;
 import io.mosip.biometrics.util.face.FaceDecoder;
-import io.mosip.digitalcard.constant.*;
+import io.mosip.digitalcard.constant.ApiName;
+import io.mosip.digitalcard.constant.DigitalCardConstants;
+import io.mosip.digitalcard.constant.DigitalCardServiceErrorCodes;
+import io.mosip.digitalcard.constant.PDFGeneratorExceptionCodeConstant;
 import io.mosip.digitalcard.dto.PDFSignatureRequestDto;
 import io.mosip.digitalcard.dto.SignatureResponseDto;
-import io.mosip.digitalcard.dto.SimpleType;
-import io.mosip.digitalcard.service.CardGeneratorService;
 import io.mosip.digitalcard.exception.DigitalCardServiceException;
 import io.mosip.digitalcard.exception.IdentityNotFoundException;
 import io.mosip.digitalcard.repositories.DigitalCardTransactionRepository;
+import io.mosip.digitalcard.service.CardGeneratorService;
+import io.mosip.digitalcard.service.PixelPassService;
 import io.mosip.digitalcard.util.*;
 import io.mosip.kernel.biometrics.spi.CbeffUtil;
 import io.mosip.kernel.core.exception.ServiceError;
@@ -29,20 +32,22 @@ import io.mosip.vercred.CredentialsVerifier;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.codec.binary.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
-import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
-import org.json.simple.parser.JSONParser;
-import org.json.simple.parser.ParseException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.env.Environment;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 
-import java.io.*;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 @Service
 public class PDFCardServiceImpl implements CardGeneratorService {
@@ -65,7 +70,6 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 	/** The Constant APPLICANT_PHOTO. */
 	private static final String APPLICANT_PHOTO = "ApplicantPhoto";
 
-	private static final String TEMPLATE_TYPE_CODE = "templateTypeCode";
 
 	/** The Constant QRCODE. */
 	private static final String QRCODE = "QrCode";
@@ -103,11 +107,12 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 	@Autowired
 	private CredentialsVerifier credentialsVerifier;
 
-	@Value("${mosip.template-language}")
-	private String templateLang;
+	@Autowired
+	private PixelPassService pixelPassService;
 
-	@Value("${mosip.supported-languages}")
-	private String supportedLang;
+	//for signature
+	@Value("${mosip.print.service.uincard.signature.required:true}")
+	private boolean isSignatureRequired;
 
 	@Value("${mosip.digitalcard.service.uincard.lowerleftx}")
 	private int lowerLeftX;
@@ -124,9 +129,6 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 	@Value("${mosip.digitalcard.service.uincard.signature.reason}")
 	private String reason;
 
-	/*@Value("${mosip.digitalcard.templateTypeCode:RPR_UIN_CARD_TEMPLATE}")
-	private String uinCardTemplate;*/
-
 	@Value("${mosip.digitalcard.uin.card.default.templateTypeCode:RPR_UIN_CARD_TEMPLATE}")
 	private String defaultTemplateTypeCode;
 
@@ -140,17 +142,14 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see io.mosip.digitalcard.service.PDFService#
 	 */
 	public byte[] generateCard(org.json.JSONObject decryptedCredentialJson, String credentialType,
-							   String password, Map<String, Object> additionalAttributes) throws Exception {
+							   String password, Map<String, Object>  attributes, String templateLang , String vc) throws Exception {
 		logger.debug("PDFServiceImpl::getDocuments()::entry");
-		boolean isGenerated=false;
-		String uin = null;
 		boolean isPhotoSet=false;
 		String individualBio = null;
-		Map<String, Object> attributes = new LinkedHashMap<>();
 		String templateTypeCode = defaultTemplateTypeCode;
 		byte[] pdfbytes = null;
 		try {
@@ -161,13 +160,11 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 				isPhotoSet = setApplicantPhoto(individualBiometric, attributes);
 				attributes.put("isPhotoSet",isPhotoSet);
 			}
-			uin = decryptedCredentialJson.getString("UIN");
-			attributes.putAll(additionalAttributes);
-			if(additionalAttributes.containsKey(TEMPLATE_TYPE_CODE)) {
-				templateTypeCode = additionalAttributes.get(TEMPLATE_TYPE_CODE).toString();
+			if(attributes.containsKey(DigitalCardConstants.TEMPLATE_TYPE_CODE)) {
+				templateTypeCode = attributes.get(DigitalCardConstants.TEMPLATE_TYPE_CODE).toString();
 			}
 			if (credentialType.equalsIgnoreCase("qrcode")) {
-				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(), attributes,isPhotoSet);
+				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(), vc,attributes,isPhotoSet);
 				InputStream uinArtifact = templateGenerator.getTemplate(templateTypeCode, attributes, templateLang);
 				pdfbytes = generateUinCard(uinArtifact, password);
 			} else {
@@ -175,14 +172,11 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 					logger.debug(DigitalCardServiceErrorCodes.APPLICANT_PHOTO_NOT_SET.name());
 				}
 				logger.info("attributes count before setTemplateAttributes: {}",attributes.size());
-				setTemplateAttributes(decryptedCredentialJson, attributes);
-				logger.info("attributes count after setTemplateAttributes: {}",attributes.size());
-				// putting additional attribute for vid card
-				attributes.put(IdType.UIN.toString(), uin);
-				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(), attributes,isPhotoSet);
+				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(),vc, attributes,isPhotoSet);
 				if (!isQRcodeSet) {
 					logger.debug(DigitalCardServiceErrorCodes.QRCODE_NOT_SET.name());
 				}
+				logger.info("Attributes:{}", JSONObject.toJSONString(attributes));
 				// getting template and placing original valuespng
 				InputStream uinArtifact = templateGenerator.getTemplate(templateTypeCode, attributes, templateLang);
 				if (uinArtifact == null) {
@@ -226,19 +220,38 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 	 *                                                            occurred.
 	 * @throws QrcodeGenerationException
 	 */
-	private boolean setQrCode(String qrString, Map<String, Object> attributes,boolean isPhotoSet)
+	private boolean setQrCode(String qrString,String vc, Map<String, Object> attributes,boolean isPhotoSet)
 			throws IOException, QrcodeGenerationException {
 		boolean isQRCodeSet = false;
 		JSONObject qrJsonObj = objectMapper.readValue(qrString, JSONObject.class);
-		if(isPhotoSet) {
-			qrJsonObj.remove("biometrics");
-		}
-		byte[] qrCodeBytes = qrCodeGenerator.generateQrCode(qrJsonObj.toString(), QrVersion.V30);
-		if (qrCodeBytes != null) {
-			String imageString = Base64.encodeBase64String(qrCodeBytes);
-			attributes.put(QRCODE, "data:image/png;base64," + imageString);
+
+		String qr = pixelPassService.generateQRCode(vc);
+		if (qr != null) {
+			attributes.put(QRCODE, "data:image/png;base64," + qr);
+			logger.info("==========================================");
+			logger.info("QR Length : {}", qr.length());
+			if (qr.length() > 100) {
+				logger.info("QR Starts : {}", qr.substring(0, 100));
+			} else {
+				logger.info("QR Value : {}", qr);
+			}
+			logger.info("Attributes contains QrCode : {}", attributes.containsKey("QrCode"));
+			logger.info("QrCode Attribute : {}", attributes.get("QrCode"));
+			logger.info("==========================================");
+			logger.info("QR IMAGE : {}", qr);
 			isQRCodeSet = true;
 		}
+
+
+//		if(isPhotoSet) {
+//			qrJsonObj.remove("biometrics");
+//		}
+//		byte[] qrCodeBytes = qrCodeGenerator.generateQrCode(qrJsonObj.toString(), QrVersion.V30);
+//		if (qrCodeBytes != null) {
+//			String imageString = Base64.encodeBase64String(qrCodeBytes);
+//			attributes.put(QRCODE, "data:image/png;base64," + imageString);
+//			isQRCodeSet = true;
+//		}
 
 		return isQRCodeSet;
 	}
@@ -275,100 +288,50 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 		return isPhotoSet;
 	}
 
-	/**
-	 * Gets the artifacts.
-	 *
-	 * @param attribute    the attribute
-	 * @return the artifacts
-	 * @throws IOException    Signals that an I/O exception has occurred.
-	 * @throws ParseException
-	 */
-	@SuppressWarnings("unchecked")
-	private void setTemplateAttributes(org.json.JSONObject demographicIdentity, Map<String, Object> attribute)
-			throws Exception {
-		try {
-			if (demographicIdentity == null)
-				throw new IdentityNotFoundException(DigitalCardServiceErrorCodes.IDENTITY_NOT_FOUND.getErrorCode(),DigitalCardServiceErrorCodes.IDENTITY_NOT_FOUND.getErrorMessage());
-
-			String mapperJsonString = utility.getIdentityMappingJson(utility.getConfigServerFileStorageURL(),
-					utility.getIdentityJson());
-			JSONObject mapperJson = objectMapper.readValue(mapperJsonString, JSONObject.class);
-			JSONObject mapperIdentity = utility.getJSONObject(mapperJson,
-					utility.getDemographicIdentity());
-
-			List<String> mapperJsonKeys = new ArrayList<>(mapperIdentity.keySet());
-			for (String key : mapperJsonKeys) {
-				LinkedHashMap<String, String> jsonObject = utility.getJSONValue(mapperIdentity, key);
-				Object obj = null;
-				String values = jsonObject.get(VALUE);
-				for (String value : values.split(",")) {
-					// Object object = demographicIdentity.get(value);
-					Object object = demographicIdentity.has(value)?demographicIdentity.get(value):null;
-					if (object != null) {
-						try {
-							obj = new JSONParser().parse(object.toString());
-						} catch (Exception e) {
-							obj = object;
-						}
-
-						if (obj instanceof JSONArray && !key.equalsIgnoreCase("bestTwoFingers")) {
-							// JSONArray node = JsonUtil.getJSONArray(demographicIdentity, value);
-							SimpleType[] jsonValues = Utility.mapJsonNodeToJavaObject(SimpleType.class, (JSONArray) obj);
-							for (SimpleType jsonValue : jsonValues) {
-								if (supportedLang.contains(jsonValue.getLanguage()))
-									attribute.put(value + "_" + jsonValue.getLanguage(), jsonValue.getValue());
-							}
-						} else if (object instanceof JSONObject) {
-							JSONObject json = (JSONObject) object;
-							attribute.put(value, (String) json.get(VALUE));
-						} else {
-							attribute.put(value, String.valueOf(object));
-						}
-					}
-
-				}
-			}
-			} catch (JsonParseException | JsonMappingException | DigitalCardServiceException e) {
-				logger.error("Error while parsing Json file" ,e);
-		}
-
-	}
-
 	private byte[] generateUinCard(InputStream in, String password) {
 		logger.debug("UinCardGeneratorImpl::generateUinCard()::entry");
 		byte[] pdfSignatured=null;
 		ByteArrayOutputStream out = null;
 		try {
 			out = (ByteArrayOutputStream) pdfGenerator.generate(in);
-			PDFSignatureRequestDto request = new PDFSignatureRequestDto(lowerLeftX, lowerLeftY, upperRightX,
-					upperRightY, reason, 1, password);
-			request.setApplicationId("KERNEL");
-			request.setReferenceId("SIGN");
-			request.setData(Base64.encodeBase64String(out.toByteArray()));
-			DateTimeFormatter format = DateTimeFormatter.ofPattern(env.getProperty(DATETIME_PATTERN));
-			LocalDateTime localdatetime = LocalDateTime
-					.parse(DateUtils2.getUTCCurrentDateTimeString(env.getProperty(DATETIME_PATTERN)), format);
+			//for signature
+			logger.debug("Signature required - "+isSignatureRequired);
+			if(isSignatureRequired) {
+				logger.debug("Signature required inside true - "+isSignatureRequired);
+				PDFSignatureRequestDto request = new PDFSignatureRequestDto(lowerLeftX, lowerLeftY, upperRightX,
+						upperRightY, reason, 1, password);
+				request.setApplicationId("KERNEL");
+				request.setReferenceId("SIGN");
+				request.setData(Base64.encodeBase64String(out.toByteArray()));
+				DateTimeFormatter format = DateTimeFormatter.ofPattern(env.getProperty(DATETIME_PATTERN));
+				LocalDateTime localdatetime = LocalDateTime
+						.parse(DateUtils2.getUTCCurrentDateTimeString(env.getProperty(DATETIME_PATTERN)), format);
 
-			request.setTimeStamp(DateUtils2.getUTCCurrentDateTimeString());
-			RequestWrapper<PDFSignatureRequestDto> requestWrapper = new RequestWrapper<>();
+				request.setTimeStamp(DateUtils2.getUTCCurrentDateTimeString());
+				RequestWrapper<PDFSignatureRequestDto> requestWrapper = new RequestWrapper<>();
 
-			requestWrapper.setRequest(request);
-			requestWrapper.setRequesttime(localdatetime);
-			ResponseWrapper<?> responseWrapper;
-			SignatureResponseDto signatureResponseDto;
+				requestWrapper.setRequest(request);
+				requestWrapper.setRequesttime(localdatetime);
+				ResponseWrapper<?> responseWrapper;
+				SignatureResponseDto signatureResponseDto;
 
-			responseWrapper= restApiClient.postApi(ApiName.PDFSIGN, null, "",""
-					, MediaType.APPLICATION_JSON,requestWrapper, ResponseWrapper.class);
+				responseWrapper= restApiClient.postApi(ApiName.PDFSIGN, null, "",""
+						, MediaType.APPLICATION_JSON,requestWrapper, ResponseWrapper.class);
 
 
-			if (responseWrapper.getErrors() != null && !responseWrapper.getErrors().isEmpty()) {
-				ServiceError error = responseWrapper.getErrors().get(0);
-				throw new DigitalCardServiceException(error.getMessage());
+				if (responseWrapper.getErrors() != null && !responseWrapper.getErrors().isEmpty()) {
+					ServiceError error = responseWrapper.getErrors().get(0);
+					throw new DigitalCardServiceException(error.getMessage());
+				}
+				signatureResponseDto = objectMapper.readValue(objectMapper.writeValueAsString(responseWrapper.getResponse()),
+						SignatureResponseDto.class);
+
+				pdfSignatured = Base64.decodeBase64(signatureResponseDto.getData());
+				//for signature
+			} else {
+				logger.debug("Signature required inside false - "+isSignatureRequired);
+				pdfSignatured = out.toByteArray();
 			}
-			signatureResponseDto = objectMapper.readValue(objectMapper.writeValueAsString(responseWrapper.getResponse()),
-					SignatureResponseDto.class);
-
-			pdfSignatured = Base64.decodeBase64(signatureResponseDto.getData());
 
 		} catch (Exception e) {
 			logger.info("ERROR[] :{}",e);

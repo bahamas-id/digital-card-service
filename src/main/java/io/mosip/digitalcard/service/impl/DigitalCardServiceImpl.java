@@ -2,17 +2,18 @@ package io.mosip.digitalcard.service.impl;
 
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosip.digitalcard.constant.DigitalCardServiceErrorCodes;
+import io.mosip.digitalcard.constant.IdType;
 import io.mosip.digitalcard.controller.DigitalCardController;
 import io.mosip.digitalcard.dto.*;
 import io.mosip.digitalcard.entity.DigitalCardTransactionEntity;
-import io.mosip.digitalcard.exception.ApiNotAccessibleException;
-import io.mosip.digitalcard.exception.DataNotFoundException;
-import io.mosip.digitalcard.exception.DataShareException;
-import io.mosip.digitalcard.exception.DigitalCardServiceException;
+import io.mosip.digitalcard.exception.*;
 import io.mosip.digitalcard.repositories.DigitalCardTransactionRepository;
-import io.mosip.digitalcard.service.DigitalCardService;
 import io.mosip.digitalcard.service.CardGeneratorService;
+import io.mosip.digitalcard.service.DigitalCardService;
+import io.mosip.digitalcard.service.EmailHelperService;
+import io.mosip.digitalcard.service.PrintInjiVcService;
 import io.mosip.digitalcard.util.*;
 import io.mosip.digitalcard.websub.CredentialStatusEvent;
 import io.mosip.digitalcard.websub.StatusEvent;
@@ -22,17 +23,16 @@ import io.mosip.kernel.core.logger.spi.Logger;
 import io.mosip.kernel.core.pdfgenerator.exception.PDFGeneratorException;
 import io.mosip.kernel.core.qrcodegenerator.exception.QrcodeGenerationException;
 import io.mosip.kernel.core.util.DateUtils2;
-import io.mosip.kernel.core.websub.model.EventModel;
 import io.mosip.vercred.CredentialsVerifier;
 import org.json.JSONObject;
 import org.json.simple.JSONArray;
 import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
-
+import org.springframework.util.StringUtils;
 import java.io.IOException;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
@@ -73,6 +73,15 @@ public class DigitalCardServiceImpl implements DigitalCardService {
     @Autowired
     DigitalCardTransactionRepository digitalCardTransactionRepository;
 
+    @Autowired
+    private EmailHelperService emailHelperService;
+
+    @Autowired
+    private LanguageUtility languageUtility;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
     /** The Constant VALUE. */
     private static final String VALUE = "value";
 
@@ -91,6 +100,10 @@ public class DigitalCardServiceImpl implements DigitalCardService {
     @Value("${mosip.digitalcard.pdf.password.enable.flag:true}")
     private boolean isPasswordProtected;
 
+    @Value("${mosip.digitalcard.email.attachment.enable.flag:false}")
+    private Boolean isEmailEnabled;
+
+
     @Value("${mosip.digitalcard.credential.request.partner.id}")
     private String partnerId;
 
@@ -104,25 +117,222 @@ public class DigitalCardServiceImpl implements DigitalCardService {
     private String digitalCardPassword;
 
     @Value("${mosip.template-language}")
-    private String templateLang;
+    private String defaultTplLangCode;
+
+    @Value("${mosip.supported-languages}")
+    private String supportedLang;
 
 
-    Logger logger = DigitalCardRepoLogger.getLogger(DigitalCardController.class);
+    @Value("${mosip.default.user-preferred-language-attribute:#{null}}")
+    private String userPreferredLanguageAttribute;
+
+    private Logger logger = DigitalCardRepoLogger.getLogger(DigitalCardController.class);
+
+    @Autowired
+    private PrintInjiVcService printInjiVcService;
+
+    public final class CredentialConstants {
+
+        private CredentialConstants() {
+        }
+
+        public static final String FIRST_NAME = "firstName";
+        public static final String LAST_NAME = "lastName";
+        public static final String DATE_OF_BIRTH = "dateOfBirth";
+        public static final String EMAIL = "email";
+        public static final String PHONE = "phone";
+        public static final String UIN = "UIN";
+        public static final String VID = "VID";
+
+        public static final String ADDRESS_LINE1 = "addressLine1";
+        public static final String ADDRESS_LINE2 = "addressLine2";
+        public static final String ADDRESS_LINE3 = "addressLine3";
+        public static final String STATE = "state";
+        public static final String CITY = "city";
+        public static final String POSTAL_CODE = "postalCode";
+
+    }
+
 
     public void generateDigitalCard(String credential, String credentialType,String dataShareUrl,String eventId,String transactionId,Map<String,Object> additionalAttributes) {
         boolean isGenerated = false;
+        Map<String, Object> attributes = new LinkedHashMap<>();
         String decryptedCredential=null;
         String password=null;
         String rid=null;
+        String firstName=null;
+        String lastName=null;
+        String dob=null;
+        String email=null;
+        String phone=null;
+        String UIN=null;
+        String VID=null;
+        String addressLine1=null;
+        String addressLine2=null;
+        String addressLine3=null;
+        String state=null;
+        String city=null;
+        String postalCode=null;
+        String address=null;
         try {
             if (dataShareUrl != null) {
                 credential = restClient.getForObject(dataShareUrl, String.class);
             }
+            attributes.putAll(additionalAttributes);
             decryptedCredential = encryptionUtil.decryptData(credential);
             JSONObject jsonObject = new org.json.JSONObject(decryptedCredential);
             JSONObject decryptedCredentialJson = jsonObject.getJSONObject("credentialSubject");
+            logger.info("DECRYPTED JSON RESPONSE {}", decryptedCredentialJson);
             rid=getRid(decryptedCredentialJson.get("id"));
-            if (verifyCredentialsFlag){
+
+//          firstName
+            org.json.JSONArray firstNameArray =
+                    decryptedCredentialJson.getJSONArray(CredentialConstants.FIRST_NAME);
+            org.json.JSONObject firstNameObj = firstNameArray.getJSONObject(0);
+            firstName = firstNameObj.getString(VALUE);
+
+//          lastName
+            org.json.JSONArray lastNameArray =
+                    decryptedCredentialJson.getJSONArray(CredentialConstants.LAST_NAME);
+            org.json.JSONObject lastNameObj = lastNameArray.getJSONObject(0);
+            lastName = lastNameObj.getString(VALUE);
+
+            dob = decryptedCredentialJson.getString(CredentialConstants.DATE_OF_BIRTH);
+            email = decryptedCredentialJson.getString(CredentialConstants.EMAIL);
+            phone = decryptedCredentialJson.getString(CredentialConstants.PHONE);
+            UIN = decryptedCredentialJson.getString(CredentialConstants.UIN);
+            VID = decryptedCredentialJson.getString(CredentialConstants.VID);
+
+//          addressLine1
+            org.json.JSONArray addressLine1Array =
+                    decryptedCredentialJson.getJSONArray(CredentialConstants.ADDRESS_LINE1);
+            org.json.JSONObject addressLine1Obj = addressLine1Array.getJSONObject(0);
+            addressLine1 = addressLine1Obj.getString(VALUE);
+
+//          addressLine2 (Optional)
+            if (decryptedCredentialJson.has(CredentialConstants.ADDRESS_LINE2)
+                    && !decryptedCredentialJson.isNull(CredentialConstants.ADDRESS_LINE2)) {
+
+                org.json.JSONArray addressLine2Array =
+                        decryptedCredentialJson.getJSONArray(CredentialConstants.ADDRESS_LINE2);
+
+                if (addressLine2Array.length() > 0) {
+                    addressLine2 = addressLine2Array.getJSONObject(0)
+                            .optString(VALUE, null);
+                }
+            }
+
+//          addressLine3 (Optional)
+            if (decryptedCredentialJson.has(CredentialConstants.ADDRESS_LINE3)
+                    && !decryptedCredentialJson.isNull(CredentialConstants.ADDRESS_LINE3)) {
+
+                org.json.JSONArray addressLine3Array =
+                        decryptedCredentialJson.getJSONArray(CredentialConstants.ADDRESS_LINE3);
+
+                if (addressLine3Array.length() > 0) {
+                    addressLine3 = addressLine3Array.getJSONObject(0)
+                            .optString(VALUE, null);
+                }
+            }
+
+//          state (Optional)
+            if (decryptedCredentialJson.has(CredentialConstants.STATE)
+                    && !decryptedCredentialJson.isNull(CredentialConstants.STATE)) {
+
+                org.json.JSONArray stateArray =
+                        decryptedCredentialJson.getJSONArray(CredentialConstants.STATE);
+
+                if (stateArray.length() > 0) {
+                    state = stateArray.getJSONObject(0)
+                            .optString(VALUE, null);
+                }
+            }
+
+//          city (Optional)
+            if (decryptedCredentialJson.has(CredentialConstants.CITY)
+                    && !decryptedCredentialJson.isNull(CredentialConstants.CITY)) {
+
+                org.json.JSONArray cityArray =
+                        decryptedCredentialJson.getJSONArray(CredentialConstants.CITY);
+
+                if (cityArray.length() > 0) {
+                    city = cityArray.getJSONObject(0)
+                            .optString(VALUE, null);
+                }
+            }
+
+            postalCode = decryptedCredentialJson.getString(CredentialConstants.POSTAL_CODE);
+
+//          build address
+            StringBuilder addressBuilder = new StringBuilder();
+
+            if (addressLine1 != null && !addressLine1.trim().isEmpty()) {
+                addressBuilder.append(addressLine1);
+            }
+
+            if (addressLine2 != null && !addressLine2.trim().isEmpty()) {
+                if (!addressBuilder.isEmpty()) {
+                    addressBuilder.append(",");
+                }
+                addressBuilder.append(addressLine2);
+            }
+
+            if (addressLine3 != null && !addressLine3.trim().isEmpty()) {
+                if (!addressBuilder.isEmpty()) {
+                    addressBuilder.append(",");
+                }
+                addressBuilder.append(addressLine3);
+            }
+
+            if (state != null && !state.trim().isEmpty()) {
+                if (!addressBuilder.isEmpty()) {
+                    addressBuilder.append(",");
+                }
+                addressBuilder.append(state);
+            }
+
+            if (city != null && !city.trim().isEmpty()) {
+                if (!addressBuilder.isEmpty()) {
+                    addressBuilder.append(",");
+                }
+                addressBuilder.append(city);
+            }
+
+            if (postalCode != null && !postalCode.trim().isEmpty()) {
+                if (!addressBuilder.isEmpty()) {
+                    addressBuilder.append(",");
+                }
+                addressBuilder.append(postalCode);
+            }
+
+            address = addressBuilder.toString();
+
+            // Sending data to printInjiVcService
+            Map<String, Object> claims = new LinkedHashMap<>();
+            claims.put(CredentialConstants.FIRST_NAME, lastName);
+            claims.put(CredentialConstants.LAST_NAME, firstName);
+            claims.put(CredentialConstants.DATE_OF_BIRTH, dob);
+            claims.put(CredentialConstants.EMAIL, email);
+            claims.put(CredentialConstants.PHONE, phone);
+            claims.put(CredentialConstants.UIN, UIN);
+            claims.put(CredentialConstants.VID, VID);
+            claims.put("address", address);
+            String vc = printInjiVcService.generatePreAuthorizedCode(claims);
+
+
+            attributes.put(IdType.RID.toString(), rid);
+            //sets additional attributes for all templates.
+            setTemplateAttributes(decryptedCredentialJson, attributes);
+            String prefLangAttr = (String) attributes.get(userPreferredLanguageAttribute);
+            logger.info("prefLangAttr {}", prefLangAttr);
+
+            String templateLangCode = languageUtility.getLangCodeFromNativeName(prefLangAttr);
+            logger.info("templateLangCode: {}, defaultTplLangCode: {}", templateLangCode, defaultTplLangCode);
+            logger.info("Additional Attributes: {}", attributes);
+            if (!StringUtils.hasText(templateLangCode)) {
+                templateLangCode = defaultTplLangCode;
+            }
+            if (verifyCredentialsFlag) {
                 logger.info("Configured received credentials to be verified. Flag {}", verifyCredentialsFlag);
                 boolean verified =credentialsVerifier.verifyCredentials(decryptedCredential);
                 if (!verified) {
@@ -133,10 +343,14 @@ public class DigitalCardServiceImpl implements DigitalCardService {
                 }
             }
             if (isPasswordProtected) {
-                password = getPassword(decryptedCredentialJson);
+                password = getPassword(decryptedCredentialJson, templateLangCode);
             }
-            byte[] pdfBytes=pdfCardServiceImpl.generateCard(decryptedCredentialJson, credentialType,password,additionalAttributes);
+            byte[] pdfBytes=pdfCardServiceImpl.generateCard(decryptedCredentialJson, credentialType,password,attributes, templateLangCode ,vc);
             digitalCardStatusUpdate(transactionId,pdfBytes,credentialType,rid);
+            // Send digital Card Pdf to Email
+            if (isEmailEnabled) {
+                emailHelperService.sendDigitalCardInEmail((String) attributes.get(IdType.RID.toString()), attributes, pdfBytes, templateLangCode);
+            }
             logger.info("successfully generated the digitalcard for rid: {}",rid);
         }catch (QrcodeGenerationException e) {
             loginErrorDetails(rid,DigitalCardServiceErrorCodes.QRCODE_NOT_GENERATED.getError());
@@ -249,7 +463,7 @@ public class DigitalCardServiceImpl implements DigitalCardService {
      * @return
      * @throws Exception
      */
-    private String getPassword(JSONObject jsonObject) throws Exception {
+    private String getPassword(JSONObject jsonObject, String tplLangCode) throws Exception {
         String[] attributes = digitalCardPassword.split("\\|");
         List<String> list = new ArrayList<>(Arrays.asList(attributes));
 
@@ -270,7 +484,7 @@ public class DigitalCardServiceImpl implements DigitalCardService {
             if (obj instanceof JSONArray) {
                 // JSONArray node = JsonUtil.getJSONArray(demographicIdentity, value);
                 SimpleType[] jsonValues = Utility.mapJsonNodeToJavaObject(SimpleType.class, (JSONArray) obj);
-                uinCardPd = uinCardPd.concat(getFormattedPasswordAttribute(getParameter(jsonValues, templateLang)).substring(0,4));
+                uinCardPd = uinCardPd.concat(getFormattedPasswordAttribute(getParameter(jsonValues, tplLangCode)).substring(0,4));
             } else if (object instanceof org.json.simple.JSONObject) {
                 org.json.simple.JSONObject json = (org.json.simple.JSONObject) object;
                 uinCardPd = uinCardPd.concat((String) json.get(VALUE));
@@ -318,6 +532,64 @@ public class DigitalCardServiceImpl implements DigitalCardService {
     }
     public void loginErrorDetails(String rid, String errorMsg){
         digitalCardTransactionRepository.updateErrorTransactionDetails(rid,"ERROR",errorMsg,LocalDateTime.now(),Utility.getUser());
+    }
+    /**
+     * Gets the artifacts.
+     *
+     * @param attribute    the attribute
+     * @return the artifacts
+     * @throws IOException    Signals that an I/O exception has occurred.
+     * @throws ParseException
+     */
+    @SuppressWarnings("unchecked")
+    private void setTemplateAttributes(org.json.JSONObject demographicIdentity, Map<String, Object> attribute)
+            throws Exception {
+        try {
+            if (demographicIdentity == null)
+                throw new IdentityNotFoundException(DigitalCardServiceErrorCodes.IDENTITY_NOT_FOUND.getErrorCode(),DigitalCardServiceErrorCodes.IDENTITY_NOT_FOUND.getErrorMessage());
+
+            String mapperJsonString = utility.getIdentityMappingJson(utility.getConfigServerFileStorageURL(),
+                    utility.getIdentityJson());
+            org.json.simple.JSONObject mapperJson = objectMapper.readValue(mapperJsonString, org.json.simple.JSONObject.class);
+            org.json.simple.JSONObject mapperIdentity = utility.getJSONObject(mapperJson,
+                    utility.getDemographicIdentity());
+
+            List<String> mapperJsonKeys = new ArrayList<>(mapperIdentity.keySet());
+            for (String key : mapperJsonKeys) {
+                LinkedHashMap<String, String> jsonObject = utility.getJSONValue(mapperIdentity, key);
+                Object obj = null;
+                String values = jsonObject.get(VALUE);
+                for (String value : values.split(",")) {
+                    // Object object = demographicIdentity.get(value);
+                    Object object = demographicIdentity.has(value)?demographicIdentity.get(value):null;
+                    if (object != null) {
+                        try {
+                            obj = new JSONParser().parse(object.toString());
+                        } catch (Exception e) {
+                            obj = object;
+                        }
+
+                        if (obj instanceof JSONArray && !key.equalsIgnoreCase("bestTwoFingers")) {
+                            // JSONArray node = JsonUtil.getJSONArray(demographicIdentity, value);
+                            SimpleType[] jsonValues = Utility.mapJsonNodeToJavaObject(SimpleType.class, (JSONArray) obj);
+                            for (SimpleType jsonValue : jsonValues) {
+                                if (supportedLang.contains(jsonValue.getLanguage()))
+                                    attribute.put(value + "_" + jsonValue.getLanguage(), jsonValue.getValue());
+                            }
+                        } else if (object instanceof org.json.simple.JSONObject) {
+                            org.json.simple.JSONObject json = (org.json.simple.JSONObject) object;
+                            attribute.put(value, (String) json.get(VALUE));
+                        } else {
+                            attribute.put(value, String.valueOf(object));
+                        }
+                    }
+
+                }
+            }
+        } catch (JsonParseException | JsonMappingException | DigitalCardServiceException e) {
+            logger.error("Error while parsing Json file" ,e);
+        }
+
     }
 
 }
