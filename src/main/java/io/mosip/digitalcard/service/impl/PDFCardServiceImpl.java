@@ -15,7 +15,6 @@ import io.mosip.digitalcard.exception.DigitalCardServiceException;
 import io.mosip.digitalcard.exception.IdentityNotFoundException;
 import io.mosip.digitalcard.repositories.DigitalCardTransactionRepository;
 import io.mosip.digitalcard.service.CardGeneratorService;
-import io.mosip.digitalcard.service.PixelPassService;
 import io.mosip.digitalcard.util.*;
 import io.mosip.kernel.biometrics.spi.CbeffUtil;
 import io.mosip.kernel.core.exception.ServiceError;
@@ -107,13 +106,6 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 	@Autowired
 	private CredentialsVerifier credentialsVerifier;
 
-	@Autowired
-	private PixelPassService pixelPassService;
-
-	//for signature
-	@Value("${mosip.print.service.uincard.signature.required:true}")
-	private boolean isSignatureRequired;
-
 	@Value("${mosip.digitalcard.service.uincard.lowerleftx}")
 	private int lowerLeftX;
 
@@ -146,7 +138,7 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 	 * @see io.mosip.digitalcard.service.PDFService#
 	 */
 	public byte[] generateCard(org.json.JSONObject decryptedCredentialJson, String credentialType,
-							   String password, Map<String, Object>  attributes, String templateLang , String vc) throws Exception {
+							   String password, Map<String, Object>  attributes, String templateLang) throws Exception {
 		logger.debug("PDFServiceImpl::getDocuments()::entry");
 		boolean isPhotoSet=false;
 		String individualBio = null;
@@ -164,7 +156,7 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 				templateTypeCode = attributes.get(DigitalCardConstants.TEMPLATE_TYPE_CODE).toString();
 			}
 			if (credentialType.equalsIgnoreCase("qrcode")) {
-				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(), vc,attributes,isPhotoSet);
+				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(), attributes,isPhotoSet);
 				InputStream uinArtifact = templateGenerator.getTemplate(templateTypeCode, attributes, templateLang);
 				pdfbytes = generateUinCard(uinArtifact, password);
 			} else {
@@ -172,7 +164,7 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 					logger.debug(DigitalCardServiceErrorCodes.APPLICANT_PHOTO_NOT_SET.name());
 				}
 				logger.info("attributes count before setTemplateAttributes: {}",attributes.size());
-				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(),vc, attributes,isPhotoSet);
+				boolean isQRcodeSet = setQrCode(decryptedCredentialJson.toString(), attributes,isPhotoSet);
 				if (!isQRcodeSet) {
 					logger.debug(DigitalCardServiceErrorCodes.QRCODE_NOT_SET.name());
 				}
@@ -220,38 +212,19 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 	 *                                                            occurred.
 	 * @throws QrcodeGenerationException
 	 */
-	private boolean setQrCode(String qrString,String vc, Map<String, Object> attributes,boolean isPhotoSet)
+	private boolean setQrCode(String qrString, Map<String, Object> attributes,boolean isPhotoSet)
 			throws IOException, QrcodeGenerationException {
 		boolean isQRCodeSet = false;
 		JSONObject qrJsonObj = objectMapper.readValue(qrString, JSONObject.class);
-
-		String qr = pixelPassService.generateQRCode(vc);
-		if (qr != null) {
-			attributes.put(QRCODE, "data:image/png;base64," + qr);
-			logger.info("==========================================");
-			logger.info("QR Length : {}", qr.length());
-			if (qr.length() > 100) {
-				logger.info("QR Starts : {}", qr.substring(0, 100));
-			} else {
-				logger.info("QR Value : {}", qr);
-			}
-			logger.info("Attributes contains QrCode : {}", attributes.containsKey("QrCode"));
-			logger.info("QrCode Attribute : {}", attributes.get("QrCode"));
-			logger.info("==========================================");
-			logger.info("QR IMAGE : {}", qr);
+		if(isPhotoSet) {
+			qrJsonObj.remove("biometrics");
+		}
+		byte[] qrCodeBytes = qrCodeGenerator.generateQrCode(qrJsonObj.toString(), QrVersion.V30);
+		if (qrCodeBytes != null) {
+			String imageString = Base64.encodeBase64String(qrCodeBytes);
+			attributes.put(QRCODE, "data:image/png;base64," + imageString);
 			isQRCodeSet = true;
 		}
-
-
-//		if(isPhotoSet) {
-//			qrJsonObj.remove("biometrics");
-//		}
-//		byte[] qrCodeBytes = qrCodeGenerator.generateQrCode(qrJsonObj.toString(), QrVersion.V30);
-//		if (qrCodeBytes != null) {
-//			String imageString = Base64.encodeBase64String(qrCodeBytes);
-//			attributes.put(QRCODE, "data:image/png;base64," + imageString);
-//			isQRCodeSet = true;
-//		}
 
 		return isQRCodeSet;
 	}
@@ -294,44 +267,35 @@ public class PDFCardServiceImpl implements CardGeneratorService {
 		ByteArrayOutputStream out = null;
 		try {
 			out = (ByteArrayOutputStream) pdfGenerator.generate(in);
-			//for signature
-			logger.debug("Signature required - "+isSignatureRequired);
-			if(isSignatureRequired) {
-				logger.debug("Signature required inside true - "+isSignatureRequired);
-				PDFSignatureRequestDto request = new PDFSignatureRequestDto(lowerLeftX, lowerLeftY, upperRightX,
-						upperRightY, reason, 1, password);
-				request.setApplicationId("KERNEL");
-				request.setReferenceId("SIGN");
-				request.setData(Base64.encodeBase64String(out.toByteArray()));
-				DateTimeFormatter format = DateTimeFormatter.ofPattern(env.getProperty(DATETIME_PATTERN));
-				LocalDateTime localdatetime = LocalDateTime
-						.parse(DateUtils2.getUTCCurrentDateTimeString(env.getProperty(DATETIME_PATTERN)), format);
+			PDFSignatureRequestDto request = new PDFSignatureRequestDto(lowerLeftX, lowerLeftY, upperRightX,
+					upperRightY, reason, 1, password);
+			request.setApplicationId("KERNEL");
+			request.setReferenceId("SIGN");
+			request.setData(Base64.encodeBase64String(out.toByteArray()));
+			DateTimeFormatter format = DateTimeFormatter.ofPattern(env.getProperty(DATETIME_PATTERN));
+			LocalDateTime localdatetime = LocalDateTime
+					.parse(DateUtils2.getUTCCurrentDateTimeString(env.getProperty(DATETIME_PATTERN)), format);
 
-				request.setTimeStamp(DateUtils2.getUTCCurrentDateTimeString());
-				RequestWrapper<PDFSignatureRequestDto> requestWrapper = new RequestWrapper<>();
+			request.setTimeStamp(DateUtils2.getUTCCurrentDateTimeString());
+			RequestWrapper<PDFSignatureRequestDto> requestWrapper = new RequestWrapper<>();
 
-				requestWrapper.setRequest(request);
-				requestWrapper.setRequesttime(localdatetime);
-				ResponseWrapper<?> responseWrapper;
-				SignatureResponseDto signatureResponseDto;
+			requestWrapper.setRequest(request);
+			requestWrapper.setRequesttime(localdatetime);
+			ResponseWrapper<?> responseWrapper;
+			SignatureResponseDto signatureResponseDto;
 
-				responseWrapper= restApiClient.postApi(ApiName.PDFSIGN, null, "",""
-						, MediaType.APPLICATION_JSON,requestWrapper, ResponseWrapper.class);
+			responseWrapper= restApiClient.postApi(ApiName.PDFSIGN, null, "",""
+					, MediaType.APPLICATION_JSON,requestWrapper, ResponseWrapper.class);
 
 
-				if (responseWrapper.getErrors() != null && !responseWrapper.getErrors().isEmpty()) {
-					ServiceError error = responseWrapper.getErrors().get(0);
-					throw new DigitalCardServiceException(error.getMessage());
-				}
-				signatureResponseDto = objectMapper.readValue(objectMapper.writeValueAsString(responseWrapper.getResponse()),
-						SignatureResponseDto.class);
-
-				pdfSignatured = Base64.decodeBase64(signatureResponseDto.getData());
-				//for signature
-			} else {
-				logger.debug("Signature required inside false - "+isSignatureRequired);
-				pdfSignatured = out.toByteArray();
+			if (responseWrapper.getErrors() != null && !responseWrapper.getErrors().isEmpty()) {
+				ServiceError error = responseWrapper.getErrors().get(0);
+				throw new DigitalCardServiceException(error.getMessage());
 			}
+			signatureResponseDto = objectMapper.readValue(objectMapper.writeValueAsString(responseWrapper.getResponse()),
+					SignatureResponseDto.class);
+
+			pdfSignatured = Base64.decodeBase64(signatureResponseDto.getData());
 
 		} catch (Exception e) {
 			logger.info("ERROR[] :{}",e);
