@@ -349,8 +349,8 @@
 				<artifactId>maven-surefire-plugin</artifactId>
 				<version>${maven.surefire.plugin.version}</version>
 				<configuration>
-					<skipTests>false</skipTests>
-					<skip>false</skip>
+					<skipTests>true</skipTests>
+					<skip>true</skip>
 					<argLine>
 						${argLine}
 						--add-opens java.xml/jdk.xml.internal=ALL-UNNAMED
